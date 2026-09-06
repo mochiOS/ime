@@ -1,7 +1,6 @@
 use std::path::Path;
-
 use crate::lattice::Node;
-use crate::{Candidate, Dictionary, Error};
+use crate::{Candidate, Error, Segment, dictionary::*};
 
 const UNKNOWN_WORD_COST: i32 = 10_000;
 const UNKNOWN_CONTEXT_ID: u16 = 0;
@@ -9,27 +8,171 @@ const BOS_EOS_CONTEXT_ID: u16 = 0;
 
 #[derive(Debug, Clone)]
 pub struct Engine {
-	dictionary: Dictionary,
+    dictionary: Dictionary,
+}
+
+#[derive(Clone)]
+struct ConversionPath {
+	text: String,
+	cost: i32,
+	right_id: u16,
+	segments: Vec<Segment>,
 }
 
 impl Engine {
-	pub fn new(dictionary: Dictionary) -> Self {
-		Self { dictionary }
+    pub fn new(dictionary: Dictionary) -> Self {
+        Self { dictionary }
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Ok(Self {
+            dictionary: Dictionary::open(path)?,
+        })
+    }
+
+	pub fn convert(&self, reading: &str) -> Option<Candidate> {
+		self.candidates(reading, 1)
+			.into_iter()
+			.next()
 	}
 
-	pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-		Ok(Self::new(Dictionary::open(path)?))
-	}
-
-	pub fn convert(&self, reading: &str) -> Vec<Candidate> {
-		if reading.is_empty() {
+	pub fn candidates(
+		&self,
+		reading: &str,
+		limit: usize,
+	) -> Vec<Candidate> {
+		if reading.is_empty() || limit == 0 {
 			return Vec::new();
 		}
 
-		match self.best_path(reading) {
-			Some(candidate) => vec![candidate],
-			None => Vec::new(),
+		let boundaries = char_boundaries(reading);
+		let mut paths: Vec<Vec<ConversionPath>> =
+			vec![Vec::new(); reading.len() + 1];
+
+		paths[0].push(ConversionPath {
+			text: String::new(),
+			cost: 0,
+			right_id: BOS_EOS_CONTEXT_ID,
+			segments: Vec::new(),
+		});
+
+		for &start in &boundaries[..boundaries.len() - 1] {
+			if paths[start].is_empty() {
+				continue;
+			}
+
+			let suffix = &reading[start..];
+			let matches = self.dictionary.lookup_prefix(suffix);
+
+			if matches.is_empty() {
+				let Some(end) = next_boundary(&boundaries, start) else {
+					continue;
+				};
+
+				let unknown = &reading[start..end];
+				let previous_paths = paths[start].clone();
+
+				for path in previous_paths {
+					let connection_cost = self
+						.dictionary
+						.matrix()
+						.cost(path.right_id, UNKNOWN_CONTEXT_ID)
+						as i32;
+
+					let mut text = path.text.clone();
+					text.push_str(unknown);
+
+					let mut segments = path.segments.clone();
+					segments.push(Segment {
+						reading: unknown.to_string(),
+						surface: unknown.to_string(),
+					});
+
+					paths[end].push(ConversionPath {
+						text,
+						cost: path.cost
+							+ connection_cost
+							+ UNKNOWN_WORD_COST,
+						right_id: UNKNOWN_CONTEXT_ID,
+						segments,
+					});
+				}
+
+				Self::prune_paths(&mut paths[end], limit);
+				continue;
+			}
+
+			let previous_paths = paths[start].clone();
+
+			for entry in matches {
+				let end = start + entry.reading.len();
+
+				for path in &previous_paths {
+					let connection_cost = self
+						.dictionary
+						.matrix()
+						.cost(path.right_id, entry.left_id)
+						as i32;
+
+					let mut text = path.text.clone();
+					text.push_str(&entry.surface);
+
+					let mut segments = path.segments.clone();
+					segments.push(Segment {
+						reading: entry.reading.clone(),
+						surface: entry.surface.clone(),
+					});
+
+					paths[end].push(ConversionPath {
+						text,
+						cost: path.cost
+							+ connection_cost
+							+ entry.cost as i32,
+						right_id: entry.right_id,
+						segments,
+					});
+				}
+
+				Self::prune_paths(&mut paths[end], limit);
+			}
 		}
+
+		let mut results = paths[reading.len()]
+			.drain(..)
+			.map(|path| {
+				let eos_cost = self
+					.dictionary
+					.matrix()
+					.cost(path.right_id, BOS_EOS_CONTEXT_ID)
+					as i32;
+
+				Candidate {
+					text: path.text,
+					cost: path.cost + eos_cost,
+					segments: path.segments,
+				}
+			})
+			.collect::<Vec<_>>();
+
+		results.sort_by_key(|candidate| candidate.cost);
+		results.dedup_by(|a, b| a.text == b.text);
+		results.truncate(limit);
+
+		results
+	}
+
+	fn prune_paths(
+		paths: &mut Vec<ConversionPath>,
+		limit: usize,
+	) {
+		paths.sort_by_key(|path| path.cost);
+
+		paths.dedup_by(|a, b| {
+			a.text == b.text
+				&& a.right_id == b.right_id
+		});
+
+		paths.truncate(limit);
 	}
 
 	fn best_path(&self, reading: &str) -> Option<Candidate> {
@@ -38,6 +181,7 @@ impl Engine {
 		let mut ending_at: Vec<Vec<usize>> = vec![Vec::new(); reading.len() + 1];
 
 		nodes.push(Node {
+			reading: "",
 			surface: "",
 			right_id: BOS_EOS_CONTEXT_ID,
 			total_cost: 0,
@@ -52,41 +196,52 @@ impl Engine {
 
 			let suffix = &reading[start..];
 			let matches = self.dictionary.lookup_prefix(suffix);
+
 			if matches.is_empty() {
 				let end = next_boundary(&boundaries, start)?;
-				let surface = &reading[start..end];
+				let node_reading = &reading[start..end];
+
 				let (previous, total_cost) = self.best_previous(
 					&nodes,
 					&ending_at[start],
 					UNKNOWN_CONTEXT_ID,
 					UNKNOWN_WORD_COST,
 				)?;
+
 				let index = nodes.len();
+
 				nodes.push(Node {
-					surface,
+					reading: node_reading,
+					surface: node_reading,
 					right_id: UNKNOWN_CONTEXT_ID,
 					total_cost,
 					previous: Some(previous),
 				});
+
 				ending_at[end].push(index);
 				continue;
 			}
 
 			for entry in matches {
 				let end = start + entry.reading.len();
+
 				let (previous, total_cost) = self.best_previous(
 					&nodes,
 					&ending_at[start],
 					entry.left_id,
 					entry.cost as i32,
 				)?;
+
 				let index = nodes.len();
+
 				nodes.push(Node {
+					reading: &reading[start..end],
 					surface: &entry.surface,
 					right_id: entry.right_id,
 					total_cost,
 					previous: Some(previous),
 				});
+
 				ending_at[end].push(index);
 			}
 		}
@@ -96,52 +251,86 @@ impl Engine {
 			.copied()
 			.min_by_key(|&index| {
 				let node = &nodes[index];
+
 				node.total_cost
-					+ self.dictionary.matrix().cost(node.right_id, BOS_EOS_CONTEXT_ID) as i32
+					+ self
+						.dictionary
+						.matrix()
+						.cost(node.right_id, BOS_EOS_CONTEXT_ID) as i32
 			})?;
 
 		let final_cost = nodes[final_node].total_cost
-			+ self.dictionary.matrix().cost(nodes[final_node].right_id, BOS_EOS_CONTEXT_ID) as i32;
-		let mut pieces = Vec::new();
+			+ self
+				.dictionary
+				.matrix()
+				.cost(nodes[final_node].right_id, BOS_EOS_CONTEXT_ID) as i32;
+
+		let mut segments = Vec::new();
 		let mut current = final_node;
+
 		while current != 0 {
 			let node = &nodes[current];
-			pieces.push(node.surface);
+
+			segments.push(Segment {
+				reading: node.reading.to_string(),
+				surface: node.surface.to_string(),
+			});
+
 			current = node.previous?;
 		}
-		pieces.reverse();
+
+		segments.reverse();
+
+		let text = segments
+			.iter()
+			.map(|segment| segment.surface.as_str())
+			.collect::<String>();
 
 		Some(Candidate {
-			text: pieces.concat(),
+			text,
 			cost: final_cost,
+			segments,
 		})
 	}
 
-	fn best_previous(
-		&self,
-		nodes: &[Node<'_>],
-		indices: &[usize],
-		next_left_id: u16,
-		word_cost: i32,
-	) -> Option<(usize, i32)> {
-		indices
-			.iter()
-			.copied()
-			.map(|index| {
-				let previous = &nodes[index];
-				let connection = self.dictionary.matrix().cost(previous.right_id, next_left_id) as i32;
-				(index, previous.total_cost + connection + word_cost)
-			})
-			.min_by_key(|(_, cost)| *cost)
+	fn n_best_paths(&self, reading: &str, limit: usize) -> Vec<Candidate> {
+		todo!()
 	}
+
+    fn best_previous(
+        &self,
+        nodes: &[Node<'_>],
+        indices: &[usize],
+        next_left_id: u16,
+        word_cost: i32,
+    ) -> Option<(usize, i32)> {
+        indices
+            .iter()
+            .copied()
+            .map(|index| {
+                let previous = &nodes[index];
+                let connection = self
+                    .dictionary
+                    .matrix()
+                    .cost(previous.right_id, next_left_id) as i32;
+                (index, previous.total_cost + connection + word_cost)
+            })
+            .min_by_key(|(_, cost)| *cost)
+    }
 }
 
 fn char_boundaries(input: &str) -> Vec<usize> {
-	let mut boundaries = input.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
-	boundaries.push(input.len());
-	boundaries
+    let mut boundaries = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(input.len());
+    boundaries
 }
 
 fn next_boundary(boundaries: &[usize], current: usize) -> Option<usize> {
-	boundaries.iter().copied().find(|&boundary| boundary > current)
+    boundaries
+        .iter()
+        .copied()
+        .find(|&boundary| boundary > current)
 }

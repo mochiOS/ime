@@ -5,7 +5,6 @@ mod error;
 mod lattice;
 mod mime;
 
-pub use candidate::Candidate;
-pub use dictionary::{ConnectionMatrix, Dictionary, DictionaryEntry};
+pub use candidate::{Candidate, Segment};
 pub use engine::Engine;
 pub use error::Error;
