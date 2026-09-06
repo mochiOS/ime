@@ -1,0 +1,11 @@
+torch
+transformers
+datasets
+sentencepiece
+sudachipy
+sudachidict_core
+pyarrow
+tqdm
+onnx
+onnxruntime
+requests
