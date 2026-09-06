@@ -5,6 +5,11 @@ use crate::{Candidate, Error, Segment, dictionary::*};
 const UNKNOWN_WORD_COST: i32 = 10_000;
 const UNKNOWN_CONTEXT_ID: u16 = 0;
 const BOS_EOS_CONTEXT_ID: u16 = 0;
+const SAME_SURFACE_BONUS: i32 = -1_000;
+const ASCII_SURFACE_PENALTY: i32 = 30_000;
+const KATAKANA_SURFACE_PENALTY: i32 = 10_000;
+const UNUSUAL_CHARACTER_PENALTY: i32 = 15_000;
+const SEGMENT_PENALTY: i32 = 750;
 
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -17,6 +22,7 @@ struct ConversionPath {
 	cost: i32,
 	right_id: u16,
 	segments: Vec<Segment>,
+	segment_count: usize,
 }
 
 impl Engine {
@@ -54,6 +60,7 @@ impl Engine {
 			cost: 0,
 			right_id: BOS_EOS_CONTEXT_ID,
 			segments: Vec::new(),
+			segment_count: 0,
 		});
 
 		for &start in &boundaries[..boundaries.len() - 1] {
@@ -92,9 +99,11 @@ impl Engine {
 						text,
 						cost: path.cost
 							+ connection_cost
-							+ UNKNOWN_WORD_COST,
+							+ UNKNOWN_WORD_COST
+							+ SEGMENT_PENALTY,
 						right_id: UNKNOWN_CONTEXT_ID,
 						segments,
+						segment_count: path.segment_count + 1,
 					});
 				}
 
@@ -127,9 +136,15 @@ impl Engine {
 						text,
 						cost: path.cost
 							+ connection_cost
-							+ entry.cost as i32,
+							+ entry.cost as i32
+							+ Self::surface_penalty(
+								&entry.reading,
+								&entry.surface,
+							)
+							+ SEGMENT_PENALTY,
 						right_id: entry.right_id,
 						segments,
+						segment_count: path.segment_count + 1,
 					});
 				}
 
@@ -317,6 +332,53 @@ impl Engine {
             })
             .min_by_key(|(_, cost)| *cost)
     }
+
+	fn surface_penalty(reading: &str, surface: &str) -> i32 {
+		if reading == surface {
+			return SAME_SURFACE_BONUS;
+		}
+
+		let reading_has_ascii = reading
+			.chars()
+			.any(|ch| ch.is_ascii_alphanumeric());
+
+		let surface_has_ascii = surface
+			.chars()
+			.any(|ch| ch.is_ascii_alphanumeric());
+
+		if surface_has_ascii && !reading_has_ascii {
+			return ASCII_SURFACE_PENALTY;
+		}
+
+		let reading_is_hiragana = reading
+			.chars()
+			.all(|ch| matches!(ch, '\u{3040}'..='\u{309f}'));
+
+		let surface_is_katakana = surface
+			.chars()
+			.all(|ch| matches!(ch, '\u{30a0}'..='\u{30ff}'));
+
+		if reading_is_hiragana && surface_is_katakana {
+			return KATAKANA_SURFACE_PENALTY;
+		}
+
+		let unusual_characters = surface
+			.chars()
+			.filter(|ch| {
+				!reading.contains(*ch)
+					&& !matches!(
+						ch,
+						'\u{3040}'..='\u{309f}'
+							| '\u{30a0}'..='\u{30ff}'
+							| '\u{3400}'..='\u{4dbf}'
+							| '\u{4e00}'..='\u{9fff}'
+							| '\u{f900}'..='\u{faff}'
+					)
+			})
+			.count();
+
+		UNUSUAL_CHARACTER_PENALTY * unusual_characters as i32
+	}
 }
 
 fn char_boundaries(input: &str) -> Vec<usize> {
