@@ -1,5 +1,7 @@
 import argparse
 import subprocess
+from pathlib import Path
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 from sudachipy import Dictionary
@@ -7,140 +9,166 @@ from tqdm.auto import tqdm
 
 
 def parse_args():
-\tparser = argparse.ArgumentParser()
-\tparser.add_argument("--input", required=True)
-\tparser.add_argument("--output", required=True)
-\tparser.add_argument("--engine", required=True)
-\tparser.add_argument("--dictionary", required=True)
-\tparser.add_argument("--limit", type=int, default=16)
-\treturn parser.parse_args()
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--input", required=True)
+	parser.add_argument("--output", required=True)
+	parser.add_argument("--engine", required=True)
+	parser.add_argument("--dictionary", required=True)
+	parser.add_argument("--limit", type=int, default=16)
+	return parser.parse_args()
 
 
 def katakana_to_hiragana(text):
-\treturn "".join(
-\t\tchr(ord(ch) - 0x60)
-\t\tif "\u30a1" <= ch <= "\u30f6"
-\t\telse ch
-\t\tfor ch in text
-\t)
+	return "".join(
+		chr(ord(ch) - 0x60)
+		if "\u30a1" <= ch <= "\u30f6"
+		else ch
+		for ch in text
+	)
 
 
 class CandidateEngine:
-\tdef __init__(self, executable, dictionary, limit):
-\t\tself.process = subprocess.Popen(
-\t\t\t[
-\t\t\t\texecutable,
-\t\t\t\t"--dictionary",
-\t\t\t\tdictionary,
-\t\t\t\t"--limit",
-\t\t\t\tstr(limit),
-\t\t\t],
-\t\t\tstdin=subprocess.PIPE,
-\t\t\tstdout=subprocess.PIPE,
-\t\t\tstderr=subprocess.PIPE,
-\t\t\ttext=True,
-\t\t\tencoding="utf-8",
-\t\t\tbufsize=1,
-\t\t)
+	def __init__(self, executable, dictionary, limit):
+		self.process = subprocess.Popen(
+			[
+				executable,
+				"--dictionary",
+				dictionary,
+				"--limit",
+				str(limit),
+			],
+			stdin=subprocess.PIPE,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			encoding="utf-8",
+			bufsize=1,
+		)
 
-\tdef candidates(self, reading):
-\t\tself.process.stdin.write(reading + "\n")
-\t\tself.process.stdin.flush()
+	def candidates(self, reading):
+		if self.process.poll() is not None:
+			raise RuntimeError(self.process.stderr.read())
 
-\t\tcount_line = self.process.stdout.readline()
+		self.process.stdin.write(reading + "\n")
+		self.process.stdin.flush()
 
-\t\tif not count_line:
-\t\t\terror = self.process.stderr.read()
-\t\t\traise RuntimeError(error)
+		count_line = self.process.stdout.readline()
 
-\t\tcount = int(count_line.strip())
+		if not count_line:
+			raise RuntimeError(self.process.stderr.read())
 
-\t\treturn [
-\t\t\tself.process.stdout.readline().rstrip("\r\n")
-\t\t\tfor _ in range(count)
-\t\t]
+		count = int(count_line.strip())
 
-\tdef close(self):
-\t\tif self.process.poll() is None:
-\t\t\tself.process.stdin.close()
-\t\t\tself.process.wait()
+		result = []
+
+		for _ in range(count):
+			line = self.process.stdout.readline()
+
+			if not line:
+				raise RuntimeError(
+					"candidate engine terminated unexpectedly"
+				)
+
+			result.append(line.rstrip("\r\n"))
+
+		return result
+
+	def close(self):
+		if self.process.poll() is None:
+			self.process.stdin.close()
+			self.process.wait()
 
 
 def infer_error_type(positive, candidate):
-\tif positive == candidate:
-\t\treturn 0
+	if positive == candidate:
+		return 0
 
-\tif any("\u30a0" <= ch <= "\u30ff" for ch in candidate):
-\t\treturn 3
+	if any("\u30a0" <= ch <= "\u30ff" for ch in candidate):
+		return 3
 
-\tif len(candidate) != len(positive):
-\t\treturn 2
+	if any(ch.isascii() and ch.isalnum() for ch in candidate):
+		return 4
 
-\tif any(ch.isascii() and ch.isalnum() for ch in candidate):
-\t\treturn 4
+	if len(candidate) != len(positive):
+		return 2
 
-\treturn 1
+	return 1
 
 
 def main():
-\targs = parse_args()
-\tsudachi = Dictionary().create()
+	args = parse_args()
 
-\twith open(args.input, encoding="utf-8") as file:
-\t\tsentences = [
-\t\t\tline.rstrip("\r\n")
-\t\t\tfor line in file
-\t\t\tif line.strip()
-\t\t]
+	sudachi = Dictionary().create()
 
-\tengine = CandidateEngine(
-\t\targs.engine,
-\t\targs.dictionary,
-\t\targs.limit,
-\t)
+	with open(args.input, encoding="utf-8") as file:
+		sentences = [
+			line.rstrip("\r\n")
+			for line in file
+			if line.strip()
+		]
 
-\trows = []
+	engine = CandidateEngine(
+		args.engine,
+		args.dictionary,
+		args.limit,
+	)
 
-\ttry:
-\t\tfor positive in tqdm(sentences):
-\t\t\treading = katakana_to_hiragana(
-\t\t\t\t"".join(
-\t\t\t\t\tm.reading_form()
-\t\t\t\t\tfor m in sudachi.tokenize(positive)
-\t\t\t\t)
-\t\t\t)
+	rows = []
 
-\t\t\tif not reading:
-\t\t\t\tcontinue
+	try:
+		for positive in tqdm(sentences):
+			reading = katakana_to_hiragana(
+				"".join(
+					morpheme.reading_form()
+					for morpheme in sudachi.tokenize(positive)
+				)
+			)
 
-\t\t\tcandidates = engine.candidates(reading)
+			if not reading:
+				continue
 
-\t\t\tseen = {positive}
-\t\t\tnegatives = []
+			candidates = engine.candidates(reading)
 
-\t\t\tfor candidate in candidates:
-\t\t\t\tif candidate in seen:
-\t\t\t\t\tcontinue
+			seen = {positive}
+			negatives = []
 
-\t\t\t\tseen.add(candidate)
-\t\t\t\tnegatives.append({
-\t\t\t\t\t"text": candidate,
-\t\t\t\t\t"error_type": infer_error_type(positive, candidate),
-\t\t\t\t})
+			for candidate in candidates:
+				if candidate in seen:
+					continue
 
-\t\t\tif negatives:
-\t\t\t\trows.append({
-\t\t\t\t\t"reading": reading,
-\t\t\t\t\t"positive": positive,
-\t\t\t\t\t"negatives": negatives,
-\t\t\t\t})
-\tfinally:
-\t\tengine.close()
+				seen.add(candidate)
 
-\ttable = pa.Table.from_pylist(rows)
-\tpq.write_table(table, args.output)
-\tprint(f"groups: {len(rows)}")
+				negatives.append(
+					{
+						"text": candidate,
+						"error_type": infer_error_type(
+							positive,
+							candidate,
+						),
+					}
+				)
+
+			if not negatives:
+				continue
+
+			rows.append(
+				{
+					"reading": reading,
+					"positive": positive,
+					"negatives": negatives,
+				}
+			)
+	finally:
+		engine.close()
+
+	output = Path(args.output)
+	output.parent.mkdir(parents=True, exist_ok=True)
+
+	table = pa.Table.from_pylist(rows)
+	pq.write_table(table, output)
+
+	print(f"groups: {len(rows)}")
 
 
 if __name__ == "__main__":
-\tmain()
+	main()

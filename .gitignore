@@ -5,3 +5,5 @@
 **.def
 **.zip
 **.mime
+*.venv*
+**_pycache_**

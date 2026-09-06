@@ -1,6 +1,9 @@
 import argparse
 import re
+from pathlib import Path
+
 from datasets import load_dataset
+
 
 DATASET = "hotchpotch/fineweb-2-edu-japanese"
 CONFIG = "sample_10BT"
@@ -11,76 +14,79 @@ URL = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
 def parse_args():
-\tparser = argparse.ArgumentParser()
-\tparser.add_argument("--output", required=True)
-\tparser.add_argument("--max-sentences", type=int, default=100000)
-\treturn parser.parse_args()
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--output", required=True)
+	parser.add_argument("--max-sentences", type=int, default=100000)
+	return parser.parse_args()
 
 
 def split_sentences(text):
-\ttext = text.replace("\r\n", "\n").replace("\r", "\n")
-\ttext = re.sub(r"[ \t]+", " ", text)
+	text = text.replace("\r\n", "\n").replace("\r", "\n")
+	text = re.sub(r"[ \t]+", " ", text)
 
-\tfor paragraph in re.split(r"\n+", text):
-\t\tparagraph = paragraph.strip()
+	for paragraph in re.split(r"\n+", text):
+		paragraph = paragraph.strip()
 
-\t\tif not paragraph:
-\t\t\tcontinue
+		if not paragraph:
+			continue
 
-\t\tfor sentence in SENTENCE_SPLIT.split(paragraph):
-\t\t\tsentence = sentence.strip()
+		for sentence in SENTENCE_SPLIT.split(paragraph):
+			sentence = sentence.strip()
 
-\t\t\tif sentence:
-\t\t\t\tyield sentence
+			if sentence:
+				yield sentence
 
 
 def usable(sentence):
-\tlength = len(sentence)
+	length = len(sentence)
 
-\tif length < 5 or length > 160:
-\t\treturn False
+	if length < 5 or length > 160:
+		return False
 
-\tif URL.search(sentence):
-\t\treturn False
+	if URL.search(sentence):
+		return False
 
-\tjapanese = len(JAPANESE.findall(sentence))
+	japanese = len(JAPANESE.findall(sentence))
 
-\tif japanese < 3:
-\t\treturn False
+	if japanese < 3:
+		return False
 
-\treturn japanese / max(length, 1) >= 0.5
+	return japanese / max(length, 1) >= 0.5
 
 
 def main():
-\targs = parse_args()
+	args = parse_args()
 
-\tdataset = load_dataset(
-\t\tDATASET,
-\t\tCONFIG,
-\t\tsplit="train",
-\t\tstreaming=True,
-\t)
+	output = Path(args.output)
+	output.parent.mkdir(parents=True, exist_ok=True)
 
-\tcount = 0
+	dataset = load_dataset(
+		DATASET,
+		CONFIG,
+		split="train",
+		streaming=True,
+	)
 
-\twith open(args.output, "w", encoding="utf-8", newline="\n") as out:
-\t\tfor row in dataset:
-\t\t\ttext = row.get("text")
+	count = 0
 
-\t\t\tif not isinstance(text, str):
-\t\t\t\tcontinue
+	with output.open("w", encoding="utf-8", newline="\n") as out:
+		for row in dataset:
+			text = row.get("text")
 
-\t\t\tfor sentence in split_sentences(text):
-\t\t\t\tif not usable(sentence):
-\t\t\t\t\tcontinue
+			if not isinstance(text, str):
+				continue
 
-\t\t\t\tout.write(sentence + "\n")
-\t\t\t\tcount += 1
+			for sentence in split_sentences(text):
+				if not usable(sentence):
+					continue
 
-\t\t\t\tif count >= args.max_sentences:
-\t\t\t\t\tprint(f"sentences: {count}")
-\t\t\t\t\treturn
+				out.write(sentence + "\n")
+				count += 1
+
+				if count >= args.max_sentences:
+					print(f"sentences: {count}")
+					return
 
 
 if __name__ == "__main__":
-\tmain()
+	main()
