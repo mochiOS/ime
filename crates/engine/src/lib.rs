@@ -1,14 +1,11 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+mod candidate;
+mod dictionary;
+mod engine;
+mod error;
+mod lattice;
+mod mime;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use candidate::Candidate;
+pub use dictionary::{ConnectionMatrix, Dictionary, DictionaryEntry};
+pub use engine::Engine;
+pub use error::Error;
