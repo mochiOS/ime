@@ -662,7 +662,6 @@ name = "neural"
 version = "0.1.0"
 dependencies = [
  "engine",
- "ndarray",
  "ort",
  "thiserror",
  "tokenizers",

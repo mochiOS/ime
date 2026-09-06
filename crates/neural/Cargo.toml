@@ -6,6 +6,5 @@ edition = "2024"
 [dependencies]
 engine = { path = "../engine" }
 ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
-ndarray = "0.17"
 tokenizers = "0.23"
 thiserror = "2"
