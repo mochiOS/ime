@@ -61,3 +61,32 @@ fn avoids_unusual_spellings_in_ordinary_context() {
         }
     }
 }
+
+#[test]
+fn handles_mixed_ascii_counters_and_unusual_compounds() {
+    let engine = engine();
+
+    let cases = [
+        (
+            "わたしのWindowsはいぱーばいざーにはさんびきのこぶたとよつぶのめがくらしています。かれらかのじょらはくらしっくとくらすじんせいかんがあり、このんでいるようです。きょうはせいかつはいすいようびです。",
+            "私のWindowsハイパーバイザーには三匹の子豚と四粒の目が暮らしています。彼ら彼女らはクラシックと暮らす人生観があり、好んでいるようです。今日は生活排水曜日です。",
+        ),
+        (
+            "わたしのWindowsはいぱーばいざーには3びきのこぶたとよつぶのめがくらしています。かれらかのじょらはくらしっくとくらすじんせいかんがあり、このんでいるようです。きょうはせいかつはいすいようびです。",
+            "私のWindowsハイパーバイザーには3匹の子豚と四粒の目が暮らしています。彼ら彼女らはクラシックと暮らす人生観があり、好んでいるようです。今日は生活排水曜日です。",
+        ),
+        ("さんびきのこぶたとよつぶのめ", "三匹の子豚と四粒の目"),
+        ("せいかつはいすいようび", "生活排水曜日"),
+        ("Windowsはいぱーばいざー", "Windowsハイパーバイザー"),
+        ("このんでいるようです", "好んでいるようです"),
+        ("くらしています", "暮らしています"),
+    ];
+
+    for (reading, expected) in cases {
+        let actual = engine
+            .convert(reading)
+            .unwrap_or_else(|| panic!("{reading} should produce a candidate"));
+
+        assert_eq!(actual.text, expected, "{reading}");
+    }
+}

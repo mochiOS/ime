@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 const MAX_PREFIX_MATCHES_PER_READING: usize = 64;
+const MAX_LOOKUP_READING_CHARS: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryEntry {
@@ -106,6 +107,7 @@ impl Dictionary {
         let mut matches = Vec::new();
         for end in input
             .char_indices()
+            .take(MAX_LOOKUP_READING_CHARS)
             .map(|(index, ch)| index + ch.len_utf8())
         {
             let reading = &input[..end];

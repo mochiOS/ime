@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -16,6 +16,8 @@ const TRIGRAM_SIZE: u64 = 16;
 const LM_SCALE: f64 = 800.0;
 const LM_ALPHA: f64 = 0.1;
 const ORTHOGRAPHIC_VARIANT_PENALTY: i32 = 4_000;
+const GENERATED_INFLECTED_SURFACE_BONUS: i32 = -3_000;
+const GENERATED_RENYOU_ONBIN_SURFACE_BONUS: i32 = -9_000;
 const BOS_TOKEN: &str = "<s>";
 const EOS_TOKEN: &str = "</s>";
 const UNKNOWN_TOKEN: &str = "<unk>";
@@ -56,9 +58,10 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
+    let inflection_lemmas = read_lm_words(&args.lm_corpus)?;
     let mut entries = Vec::new();
     for path in &args.lexicons {
-        entries.extend(read_sudachi_csv(path)?);
+        entries.extend(read_sudachi_csv(path, &inflection_lemmas)?);
     }
     entries.sort_unstable_by(|a, b| a.reading.cmp(&b.reading).then_with(|| a.cost.cmp(&b.cost)));
 
@@ -187,7 +190,10 @@ fn print_usage() {
     );
 }
 
-fn read_sudachi_csv(path: &Path) -> Result<Vec<SourceEntry>, Box<dyn std::error::Error>> {
+fn read_sudachi_csv(
+    path: &Path,
+    inflection_lemmas: &HashSet<String>,
+) -> Result<Vec<SourceEntry>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut text = String::new();
@@ -246,12 +252,29 @@ fn read_sudachi_csv(path: &Path) -> Result<Vec<SourceEntry>, Box<dyn std::error:
             continue;
         }
         entries.push(SourceEntry {
-            reading,
-            surface,
+            reading: reading.clone(),
+            surface: surface.clone(),
             left_id: left as u16,
             right_id: right as u16,
             cost: cost as i16,
         });
+
+        if let Some(normalized) = row.get(12) {
+            if inflection_lemmas.contains(normalized) {
+                if let Some(surface) = derive_inflected_surface(&row, normalized) {
+                    let bonus = generated_inflected_surface_bonus(&row);
+                    let cost = cost.saturating_add(bonus).max(i16::MIN as i32);
+
+                    entries.push(SourceEntry {
+                        reading,
+                        surface,
+                        left_id: left as u16,
+                        right_id: right as u16,
+                        cost: cost as i16,
+                    });
+                }
+            }
+        }
     }
     Ok(entries)
 }
@@ -302,6 +325,23 @@ fn read_matrix(path: &Path) -> Result<(usize, usize, Vec<i16>), Box<dyn std::err
         costs[previous * next_size + next] = cost as i16;
     }
     Ok((previous_size, next_size, costs))
+}
+
+fn read_lm_words(path: &Path) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut words = HashSet::new();
+
+    for line in reader.lines() {
+        let line = line?;
+
+        words.extend(
+            line.split('\t')
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned),
+        );
+    }
+
+    Ok(words)
 }
 
 fn write_mime(
@@ -443,6 +483,93 @@ fn should_penalize_orthographic_variant(surface: &str, normalized: &str) -> bool
     surface
         .chars()
         .any(|ch| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
+}
+
+fn derive_inflected_surface(row: &[String], normalized: &str) -> Option<String> {
+    let surface = row.get(4)?;
+
+    if row.get(5).map(String::as_str) != Some("動詞")
+        || !row.get(9)?.starts_with("五段")
+        || !row.get(10)?.starts_with("連用形")
+        || !surface
+            .chars()
+            .all(|ch| matches!(ch, '\u{3040}'..='\u{309f}'))
+        || normalized.is_empty()
+        || normalized == "*"
+        || !contains_cjk(normalized)
+    {
+        return None;
+    }
+
+    let normalized_chars = normalized.char_indices().collect::<Vec<_>>();
+    let &(last_index, last_char) = normalized_chars.last()?;
+
+    if !matches!(last_char, '\u{3040}'..='\u{309f}') {
+        return None;
+    }
+
+    let stem = &normalized[..last_index];
+
+    if !contains_cjk(stem) {
+        return None;
+    }
+
+    let last_cjk_end = normalized_chars
+        .iter()
+        .filter_map(|&(index, ch)| {
+            if is_cjk(ch) {
+                Some(index + ch.len_utf8())
+            } else {
+                None
+            }
+        })
+        .last()?;
+
+    let stem_okurigana = &stem[last_cjk_end..];
+    let suffix = if stem_okurigana.is_empty() {
+        surface
+            .char_indices()
+            .last()
+            .map(|(index, _)| &surface[index..])?
+    } else {
+        let index = surface.find(stem_okurigana)?;
+        &surface[index + stem_okurigana.len()..]
+    };
+
+    if suffix.is_empty() {
+        return None;
+    }
+
+    if suffix == "っ" {
+        return None;
+    }
+
+    let derived = format!("{stem}{suffix}");
+
+    if derived == *surface || !contains_cjk(&derived) {
+        return None;
+    }
+
+    Some(derived)
+}
+
+fn generated_inflected_surface_bonus(row: &[String]) -> i32 {
+    if row
+        .get(10)
+        .is_some_and(|form| form.contains("撥音便") || form.contains("音便"))
+    {
+        GENERATED_RENYOU_ONBIN_SURFACE_BONUS
+    } else {
+        GENERATED_INFLECTED_SURFACE_BONUS
+    }
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}')
 }
 
 fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>> {
