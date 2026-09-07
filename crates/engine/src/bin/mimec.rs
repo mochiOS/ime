@@ -15,6 +15,7 @@ const BIGRAM_SIZE: u64 = 12;
 const TRIGRAM_SIZE: u64 = 16;
 const LM_SCALE: f64 = 800.0;
 const LM_ALPHA: f64 = 0.1;
+const ORTHOGRAPHIC_VARIANT_PENALTY: i32 = 4_000;
 const BOS_TOKEN: &str = "<s>";
 const EOS_TOKEN: &str = "</s>";
 const UNKNOWN_TOKEN: &str = "<unk>";
@@ -212,9 +213,17 @@ fn read_sudachi_csv(path: &Path) -> Result<Vec<SourceEntry>, Box<dyn std::error:
         if left < 0 || right < 0 {
             continue;
         }
-        let cost: i32 = row[3]
+        let surface = row[4].clone();
+        let mut cost: i32 = row[3]
             .parse()
             .map_err(|_| format!("{}:{}: invalid word cost", path.display(), line + 1))?;
+        if let Some(normalized) = row.get(12) {
+            if should_penalize_orthographic_variant(&surface, normalized) {
+                cost = cost
+                    .saturating_add(ORTHOGRAPHIC_VARIANT_PENALTY)
+                    .min(i16::MAX as i32);
+            }
+        }
         if left > u16::MAX as i32
             || right > u16::MAX as i32
             || cost < i16::MIN as i32
@@ -227,8 +236,6 @@ fn read_sudachi_csv(path: &Path) -> Result<Vec<SourceEntry>, Box<dyn std::error:
             )
             .into());
         }
-
-        let surface = row[4].clone();
         let source_reading = if row[11].is_empty() {
             row[0].as_str()
         } else {
@@ -420,6 +427,22 @@ fn katakana_to_hiragana(text: &str) -> String {
             }
         })
         .collect()
+}
+
+fn should_penalize_orthographic_variant(surface: &str, normalized: &str) -> bool {
+    if normalized.is_empty()
+        || normalized == "*"
+        || normalized == surface
+        || surface
+            .chars()
+            .all(|ch| matches!(ch, '\u{3040}'..='\u{309f}'))
+    {
+        return false;
+    }
+
+    surface
+        .chars()
+        .any(|ch| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'))
 }
 
 fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>> {

@@ -1,13 +1,22 @@
 use std::collections::HashMap;
 
 use crate::Error;
+use crate::LanguageModelOrder;
 use crate::mime::{BIGRAM_SIZE, TRIGRAM_SIZE, UNIGRAM_SIZE, VOCAB_ENTRY_SIZE, read_i32, read_u32};
 
 const BOS_TOKEN: &str = "<s>";
 const EOS_TOKEN: &str = "</s>";
 const UNKNOWN_TOKEN: &str = "<unk>";
 const BACKOFF_PENALTY: i32 = 500;
-const UNKNOWN_COST: i32 = 10000;
+const UNKNOWN_COST: i32 = 12000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LanguageModelCost {
+    pub(crate) cost: i32,
+    pub(crate) order: LanguageModelOrder,
+    pub(crate) backoff_penalty: i32,
+    pub(crate) unknown: bool,
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LanguageModel {
@@ -185,40 +194,98 @@ impl LanguageModel {
         self.vocabulary.get(surface).copied()
     }
 
+    pub(crate) fn context_word_id(&self, word: Option<u32>) -> Option<u32> {
+        word.or(self.unknown_id)
+    }
+
     pub(crate) fn cost(
         &self,
         before_previous: Option<u32>,
         previous: Option<u32>,
         current: Option<u32>,
     ) -> i32 {
+        self.cost_details(before_previous, previous, current).cost
+    }
+
+    pub(crate) fn cost_details(
+        &self,
+        before_previous: Option<u32>,
+        previous: Option<u32>,
+        current: Option<u32>,
+    ) -> LanguageModelCost {
         if self.vocabulary.is_empty() {
-            return 0;
+            return LanguageModelCost {
+                cost: 0,
+                order: LanguageModelOrder::Disabled,
+                backoff_penalty: 0,
+                unknown: false,
+            };
         }
 
         let Some(current) = current else {
-            return UNKNOWN_COST;
+            return LanguageModelCost {
+                cost: UNKNOWN_COST,
+                order: LanguageModelOrder::Unknown,
+                backoff_penalty: 0,
+                unknown: true,
+            };
         };
 
-        if let (Some(before_previous), Some(previous)) = (before_previous, previous) {
-            if let Some(cost) = self.trigrams.get(&(before_previous, previous, current)) {
-                return *cost;
-            }
-        }
+        let mut best = None;
 
         if let Some(previous) = previous {
             if let Some(cost) = self.bigrams.get(&(previous, current)) {
-                return cost.saturating_add(BACKOFF_PENALTY);
+                best = Some(LanguageModelCost {
+                    cost: cost.saturating_add(BACKOFF_PENALTY),
+                    order: LanguageModelOrder::Bigram,
+                    backoff_penalty: BACKOFF_PENALTY,
+                    unknown: false,
+                });
+            }
+        }
+
+        if let (Some(before_previous), Some(previous)) = (before_previous, previous) {
+            if let Some(cost) = self.trigrams.get(&(before_previous, previous, current)) {
+                best = Some(min_cost(
+                    best,
+                    LanguageModelCost {
+                        cost: *cost,
+                        order: LanguageModelOrder::Trigram,
+                        backoff_penalty: 0,
+                        unknown: false,
+                    },
+                ));
             }
         }
 
         if let Some(cost) = self.unigrams.get(&current) {
-            return cost.saturating_add(BACKOFF_PENALTY * 2);
+            return min_cost(
+                best,
+                LanguageModelCost {
+                    cost: cost.saturating_add(BACKOFF_PENALTY * 2),
+                    order: LanguageModelOrder::Unigram,
+                    backoff_penalty: BACKOFF_PENALTY * 2,
+                    unknown: false,
+                },
+            );
         }
 
-        UNKNOWN_COST
+        best.unwrap_or(LanguageModelCost {
+            cost: UNKNOWN_COST,
+            order: LanguageModelOrder::Unknown,
+            backoff_penalty: 0,
+            unknown: true,
+        })
     }
 
     pub(crate) fn eos_cost(&self, before_previous: Option<u32>, previous: Option<u32>) -> i32 {
         self.cost(before_previous, previous, self.eos_id)
+    }
+}
+
+fn min_cost(previous: Option<LanguageModelCost>, current: LanguageModelCost) -> LanguageModelCost {
+    match previous {
+        Some(previous) if previous.cost <= current.cost => previous,
+        _ => current,
     }
 }

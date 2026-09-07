@@ -1,73 +1,93 @@
+use engine::Engine;
 use std::env;
 use std::io::{self, BufRead, BufWriter, Write};
-use engine::Engine;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let mut args = env::args().skip(1);
+    let mut args = env::args().skip(1);
 
-	let mut dictionary = None;
-	let mut limit = 16;
+    let mut dictionary = None;
+    let mut limit = 16;
+    let mut debug_costs = false;
 
-	while let Some(arg) = args.next() {
-		match arg.as_str() {
-			"--dictionary" => {
-				dictionary = args.next();
-			}
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dictionary" => {
+                dictionary = args.next();
+            }
 
-			"--limit" => {
-				let value = args
-					.next()
-					.ok_or("--limit requires a value")?;
+            "--limit" => {
+                let value = args.next().ok_or("--limit requires a value")?;
 
-				limit = value.parse()?;
-			}
+                limit = value.parse()?;
+            }
 
-			_ => {
-				return Err(
-					format!("unknown argument: {arg}").into()
-				);
-			}
-		}
-	}
+            "--debug-costs" => {
+                debug_costs = true;
+            }
 
-	let dictionary =
-		dictionary.ok_or("--dictionary is required")?;
+            _ => {
+                return Err(format!("unknown argument: {arg}").into());
+            }
+        }
+    }
 
-	let engine = Engine::open(dictionary)?;
+    let dictionary = dictionary.ok_or("--dictionary is required")?;
 
-	let stdin = io::stdin();
-	let mut stdout = BufWriter::new(io::stdout());
+    let engine = Engine::open(dictionary)?;
 
-	for line in stdin.lock().lines() {
-		let reading = line?;
+    let stdin = io::stdin();
+    let mut stdout = BufWriter::new(io::stdout());
 
-		if reading.is_empty() {
-			writeln!(stdout, "0")?;
-			stdout.flush()?;
-			continue;
-		}
+    for line in stdin.lock().lines() {
+        let reading = line?;
 
-		let candidates = engine.candidates(
-			&reading,
-			limit,
-		);
+        if reading.is_empty() {
+            writeln!(stdout, "0")?;
+            stdout.flush()?;
+            continue;
+        }
 
-		writeln!(
-			stdout,
-			"{}",
-			candidates.len()
-		)?;
+        let candidates = engine.candidate_costs(&reading, limit);
 
-		for candidate in candidates {
-			writeln!(
-				stdout,
-				"{}",
-				candidate.text
-			)?;
-		}
+        writeln!(stdout, "{}", candidates.len())?;
 
-		stdout.flush()?;
-	}
+        for candidate in candidates {
+            writeln!(stdout, "{}", candidate.text)?;
 
-	Ok(())
+            if debug_costs {
+                writeln!(
+                    stdout,
+                    "  total={} base={} lm={} eos_conn={} eos_lm={}",
+                    candidate.cost,
+                    candidate.base_cost,
+                    candidate.language_cost,
+                    candidate.eos_connection_cost,
+                    candidate.eos_language_cost
+                )?;
+
+                for segment in candidate.segments {
+                    writeln!(
+                        stdout,
+                        "  {} -> {} word={} conn={} surface={} segment={} lm={} order={:?} backoff={} unk_lm={} base={} total={}",
+                        segment.reading,
+                        segment.surface,
+                        segment.word_cost,
+                        segment.connection_cost,
+                        segment.surface_penalty,
+                        segment.segment_penalty,
+                        segment.language_cost,
+                        segment.language_order,
+                        segment.backoff_penalty,
+                        segment.unknown_language_model,
+                        segment.base_cost,
+                        segment.total_cost
+                    )?;
+                }
+            }
+        }
+
+        stdout.flush()?;
+    }
+
+    Ok(())
 }
