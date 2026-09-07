@@ -6,8 +6,18 @@ use std::path::{Path, PathBuf};
 
 const MAGIC: [u8; 4] = *b"MIME";
 const VERSION: u16 = 1;
-const HEADER_SIZE: u64 = 48;
+
+const HEADER_SIZE: u64 = 104;
 const ENTRY_SIZE: u64 = 24;
+const VOCAB_ENTRY_SIZE: u64 = 8;
+const UNIGRAM_SIZE: u64 = 8;
+const BIGRAM_SIZE: u64 = 12;
+const TRIGRAM_SIZE: u64 = 16;
+const LM_SCALE: f64 = 120.0;
+const LM_ALPHA: f64 = 0.1;
+const BOS_TOKEN: &str = "<s>";
+const EOS_TOKEN: &str = "</s>";
+const UNKNOWN_TOKEN: &str = "<unk>";
 
 #[derive(Debug)]
 struct SourceEntry {
@@ -22,7 +32,18 @@ struct SourceEntry {
 struct Args {
     lexicons: Vec<PathBuf>,
     matrix: PathBuf,
+    lm_corpus: PathBuf,
+    lm_min_unigram: u64,
+    lm_min_bigram: u64,
+    lm_min_trigram: u64,
     output: PathBuf,
+}
+
+struct LanguageModelSource {
+    vocabulary: Vec<String>,
+    unigrams: Vec<(u32, i32)>,
+    bigrams: Vec<(u32, u32, i32)>,
+    trigrams: Vec<(u32, u32, u32, i32)>,
 }
 
 fn main() {
@@ -41,12 +62,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     entries.sort_unstable_by(|a, b| a.reading.cmp(&b.reading).then_with(|| a.cost.cmp(&b.cost)));
 
     let (previous_size, next_size, matrix) = read_matrix(&args.matrix)?;
-    write_mime(&args.output, &entries, previous_size, next_size, &matrix)?;
+
+    println!("building language model...");
+
+    let language_model = build_language_model(
+        &args.lm_corpus,
+        args.lm_min_unigram,
+        args.lm_min_bigram,
+        args.lm_min_trigram,
+    )?;
+
+    write_mime(
+        &args.output,
+        &entries,
+        previous_size,
+        next_size,
+        &matrix,
+        &language_model,
+    )?;
 
     println!(
-        "wrote {} entries to {}",
+        "wrote {} entries, {} words, {} unigrams, {} bigrams, {} trigrams to {}",
         entries.len(),
-        args.output.display()
+        language_model.vocabulary.len(),
+        language_model.unigrams.len(),
+        language_model.bigrams.len(),
+        language_model.trigrams.len(),
+        args.output.display(),
     );
     Ok(())
 }
@@ -54,28 +96,67 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut lexicons = Vec::new();
     let mut matrix = None;
+    let mut lm_corpus = None;
     let mut output = None;
+    let mut lm_min_unigram = 2;
+    let mut lm_min_bigram = 2;
+    let mut lm_min_trigram = 2;
     let mut args = env::args_os().skip(1);
+
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--lex") => {
-                lexicons.push(PathBuf::from(args.next().ok_or("--lex requires a path")?))
+                lexicons.push(PathBuf::from(args.next().ok_or("--lex requires a path")?));
             }
+
             Some("--matrix") => {
                 matrix = Some(PathBuf::from(
                     args.next().ok_or("--matrix requires a path")?,
-                ))
+                ));
+            }
+
+            Some("--lm-corpus") => {
+                lm_corpus = Some(PathBuf::from(
+                    args.next().ok_or("--lm-corpus requires a path")?,
+                ));
+            }
+
+            Some("--lm-min-unigram") => {
+                lm_min_unigram = args
+                    .next()
+                    .ok_or("--lm-min-unigram requires a value")?
+                    .to_string_lossy()
+                    .parse()?;
+            }
+
+            Some("--lm-min-bigram") => {
+                lm_min_bigram = args
+                    .next()
+                    .ok_or("--lm-min-bigram requires a value")?
+                    .to_string_lossy()
+                    .parse()?;
+            }
+
+            Some("--lm-min-trigram") => {
+                lm_min_trigram = args
+                    .next()
+                    .ok_or("--lm-min-trigram requires a value")?
+                    .to_string_lossy()
+                    .parse()?;
             }
             Some("-o" | "--output") => {
                 output = Some(PathBuf::from(
                     args.next().ok_or("--output requires a path")?,
-                ))
+                ));
             }
             Some("-h" | "--help") => {
                 print_usage();
                 std::process::exit(0);
             }
-            _ => return Err(format!("unknown argument: {}", arg.to_string_lossy()).into()),
+
+            _ => {
+                return Err(format!("unknown argument: {}", arg.to_string_lossy(),).into());
+            }
         }
     }
     if lexicons.is_empty() {
@@ -84,13 +165,24 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     Ok(Args {
         lexicons,
         matrix: matrix.ok_or("--matrix <matrix.def> is required")?,
+        lm_corpus: lm_corpus.ok_or("--lm-corpus <corpus.txt> is required")?,
+        lm_min_unigram,
+        lm_min_bigram,
+        lm_min_trigram,
         output: output.unwrap_or_else(|| PathBuf::from("ja.mime")),
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: mimec --lex <lex.csv> [--lex <lex.csv> ...] --matrix <matrix.def> [-o ja.mime]"
+        "Usage: mimec \
+--lex <lex.csv> [--lex <lex.csv> ...] \
+--matrix <matrix.def> \
+--lm-corpus <tokenized.txt> \
+[--lm-min-unigram <count>] \
+[--lm-min-bigram <count>] \
+[--lm-min-trigram <count>] \
+[-o ja.mime]"
     );
 }
 
@@ -211,6 +303,7 @@ fn write_mime(
     previous_size: usize,
     next_size: usize,
     matrix: &[i16],
+    language_model: &LanguageModelSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut strings = Vec::<u8>::new();
     let mut interned = HashMap::<String, (u32, u32)>::new();
@@ -221,9 +314,19 @@ fn write_mime(
         encoded_entries.push((reading, surface, entry.left_id, entry.right_id, entry.cost));
     }
 
+    let mut encoded_vocabulary = Vec::with_capacity(language_model.vocabulary.len());
+    for word in &language_model.vocabulary {
+        encoded_vocabulary.push(intern_string(word, &mut strings, &mut interned)?);
+    }
+
     let entry_offset = HEADER_SIZE;
     let string_offset = entry_offset + ENTRY_SIZE * entries.len() as u64;
     let matrix_offset = string_offset + strings.len() as u64;
+    let vocabulary_offset = matrix_offset + matrix.len() as u64 * 2;
+    let unigram_offset = vocabulary_offset + VOCAB_ENTRY_SIZE * encoded_vocabulary.len() as u64;
+    let bigram_offset = unigram_offset + UNIGRAM_SIZE * language_model.unigrams.len() as u64;
+    let trigram_offset = bigram_offset + BIGRAM_SIZE * language_model.bigrams.len() as u64;
+    let end_offset = trigram_offset + TRIGRAM_SIZE * language_model.trigrams.len() as u64;
     let mut writer = BufWriter::new(File::create(path)?);
 
     writer.write_all(&MAGIC)?;
@@ -232,10 +335,19 @@ fn write_mime(
     writer.write_all(&(entries.len() as u32).to_le_bytes())?;
     writer.write_all(&(previous_size as u32).to_le_bytes())?;
     writer.write_all(&(next_size as u32).to_le_bytes())?;
+    writer.write_all(&(language_model.vocabulary.len() as u32).to_le_bytes())?;
+    writer.write_all(&(language_model.unigrams.len() as u32).to_le_bytes())?;
+    writer.write_all(&(language_model.bigrams.len() as u32).to_le_bytes())?;
+    writer.write_all(&(language_model.trigrams.len() as u32).to_le_bytes())?;
     writer.write_all(&0u32.to_le_bytes())?;
     writer.write_all(&entry_offset.to_le_bytes())?;
     writer.write_all(&string_offset.to_le_bytes())?;
     writer.write_all(&matrix_offset.to_le_bytes())?;
+    writer.write_all(&vocabulary_offset.to_le_bytes())?;
+    writer.write_all(&unigram_offset.to_le_bytes())?;
+    writer.write_all(&bigram_offset.to_le_bytes())?;
+    writer.write_all(&trigram_offset.to_le_bytes())?;
+    writer.write_all(&end_offset.to_le_bytes())?;
 
     for (reading, surface, left_id, right_id, cost) in encoded_entries {
         writer.write_all(&reading.0.to_le_bytes())?;
@@ -247,11 +359,38 @@ fn write_mime(
         writer.write_all(&cost.to_le_bytes())?;
         writer.write_all(&0u16.to_le_bytes())?;
     }
+
     writer.write_all(&strings)?;
+
     for cost in matrix {
         writer.write_all(&cost.to_le_bytes())?;
     }
+
+    for (offset, len) in encoded_vocabulary {
+        writer.write_all(&offset.to_le_bytes())?;
+        writer.write_all(&len.to_le_bytes())?;
+    }
+
+    for &(word, cost) in &language_model.unigrams {
+        writer.write_all(&word.to_le_bytes())?;
+        writer.write_all(&cost.to_le_bytes())?;
+    }
+
+    for &(previous, current, cost) in &language_model.bigrams {
+        writer.write_all(&previous.to_le_bytes())?;
+        writer.write_all(&current.to_le_bytes())?;
+        writer.write_all(&cost.to_le_bytes())?;
+    }
+
+    for &(before_previous, previous, current, cost) in &language_model.trigrams {
+        writer.write_all(&before_previous.to_le_bytes())?;
+        writer.write_all(&previous.to_le_bytes())?;
+        writer.write_all(&current.to_le_bytes())?;
+        writer.write_all(&cost.to_le_bytes())?;
+    }
+
     writer.flush()?;
+
     Ok(())
 }
 
@@ -329,4 +468,161 @@ fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>
         rows.push(row);
     }
     Ok(rows)
+}
+
+fn build_language_model(
+    path: &Path,
+    min_unigram: u64,
+    min_bigram: u64,
+    min_trigram: u64,
+) -> Result<LanguageModelSource, Box<dyn std::error::Error>> {
+    let mut raw_unigrams = HashMap::<String, u64>::new();
+
+    {
+        let reader = BufReader::new(File::open(path)?);
+
+        for line in reader.lines() {
+            let line = line?;
+
+            for word in line.split('\t').filter(|word| !word.is_empty()) {
+                *raw_unigrams.entry(word.to_owned()).or_default() += 1;
+            }
+        }
+    }
+
+    let mut vocabulary = raw_unigrams
+        .iter()
+        .filter_map(|(word, count)| {
+            if *count >= min_unigram {
+                Some(word.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    vocabulary.push(BOS_TOKEN.to_owned());
+
+    vocabulary.push(EOS_TOKEN.to_owned());
+
+    vocabulary.push(UNKNOWN_TOKEN.to_owned());
+
+    vocabulary.sort_unstable();
+    vocabulary.dedup();
+
+    let word_ids = vocabulary
+        .iter()
+        .enumerate()
+        .map(|(id, word)| (word.clone(), id as u32))
+        .collect::<HashMap<_, _>>();
+
+    let bos_id = word_ids[BOS_TOKEN];
+    let eos_id = word_ids[EOS_TOKEN];
+    let unknown_id = word_ids[UNKNOWN_TOKEN];
+
+    let mut unigrams = HashMap::<u32, u64>::new();
+
+    let mut bigrams = HashMap::<(u32, u32), u64>::new();
+
+    let mut trigrams = HashMap::<(u32, u32, u32), u64>::new();
+
+    let reader = BufReader::new(File::open(path)?);
+
+    for line in reader.lines() {
+        let line = line?;
+
+        let mut words = Vec::new();
+
+        words.push(bos_id);
+
+        for word in line.split('\t').filter(|word| !word.is_empty()) {
+            words.push(word_ids.get(word).copied().unwrap_or(unknown_id));
+        }
+
+        words.push(eos_id);
+
+        for &word in &words {
+            *unigrams.entry(word).or_default() += 1;
+        }
+
+        for pair in words.windows(2) {
+            *bigrams.entry((pair[0], pair[1])).or_default() += 1;
+        }
+
+        for triple in words.windows(3) {
+            *trigrams
+                .entry((triple[0], triple[1], triple[2]))
+                .or_default() += 1;
+        }
+    }
+
+    let total_unigrams = unigrams.values().sum::<u64>();
+
+    let vocabulary_size = vocabulary.len();
+
+    let mut encoded_unigrams = Vec::new();
+
+    for (&word, &count) in &unigrams {
+        if count < min_unigram && word != bos_id && word != eos_id && word != unknown_id {
+            continue;
+        }
+
+        let cost = probability_cost(count, total_unigrams, vocabulary_size);
+
+        encoded_unigrams.push((word, cost));
+    }
+
+    let mut encoded_bigrams = Vec::new();
+
+    for (&(previous, current), &count) in &bigrams {
+        if count < min_bigram {
+            continue;
+        }
+
+        let denominator = unigrams.get(&previous).copied().unwrap_or(1);
+
+        let cost = probability_cost(count, denominator, vocabulary_size);
+
+        encoded_bigrams.push((previous, current, cost));
+    }
+
+    let mut encoded_trigrams = Vec::new();
+
+    for (&(before_previous, previous, current), &count) in &trigrams {
+        if count < min_trigram {
+            continue;
+        }
+
+        let denominator = bigrams
+            .get(&(before_previous, previous))
+            .copied()
+            .unwrap_or(1);
+
+        let cost = probability_cost(count, denominator, vocabulary_size);
+
+        encoded_trigrams.push((before_previous, previous, current, cost));
+    }
+
+    encoded_unigrams.sort_unstable();
+    encoded_bigrams.sort_unstable();
+    encoded_trigrams.sort_unstable();
+
+    Ok(LanguageModelSource {
+        vocabulary,
+        unigrams: encoded_unigrams,
+        bigrams: encoded_bigrams,
+        trigrams: encoded_trigrams,
+    })
+}
+
+fn probability_cost(count: u64, denominator: u64, vocabulary_size: usize) -> i32 {
+    let numerator = count as f64 + LM_ALPHA;
+
+    let denominator = denominator as f64 + LM_ALPHA * vocabulary_size as f64;
+
+    let probability = (numerator / denominator).clamp(f64::MIN_POSITIVE, 1.0);
+
+    (-probability.ln() * LM_SCALE)
+        .round()
+        .clamp(0.0, i32::MAX as f64) as i32
 }

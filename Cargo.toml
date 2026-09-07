@@ -9,5 +9,5 @@ crossterm = "0.29"
 
 [workspace]
 members = [
-    "crates/engine", "crates/neural",
+    "crates/engine",
 ]
