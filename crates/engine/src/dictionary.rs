@@ -6,6 +6,8 @@ use crate::mime::{
 use std::fs;
 use std::path::Path;
 
+const MAX_PREFIX_MATCHES_PER_READING: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryEntry {
     pub reading: String,
@@ -113,7 +115,11 @@ impl Dictionary {
             let stop = self
                 .entries
                 .partition_point(|entry| entry.reading.as_str() <= reading);
-            matches.extend(self.entries[start..stop].iter());
+            matches.extend(
+                self.entries[start..stop]
+                    .iter()
+                    .take(MAX_PREFIX_MATCHES_PER_READING),
+            );
         }
         matches
     }

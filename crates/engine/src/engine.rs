@@ -12,9 +12,9 @@ const UNUSUAL_CHARACTER_PENALTY: i32 = 15_000;
 const SEGMENT_PENALTY: i32 = 500;
 const SINGLE_CHAR_SEGMENT_PENALTY: i32 = 2_500;
 const TWO_CHAR_SEGMENT_PENALTY: i32 = 750;
-const MIN_INTERNAL_BEAM: usize = 128;
-const MAX_INTERNAL_BEAM: usize = 512;
-const INTERNAL_BEAM_MULTIPLIER: usize = 32;
+const MIN_INTERNAL_BEAM: usize = 32;
+const MAX_INTERNAL_BEAM: usize = 128;
+const INTERNAL_BEAM_MULTIPLIER: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -26,6 +26,8 @@ struct ConversionPath {
     text: String,
     base_cost: i32,
     language_cost: i32,
+    eos_connection_cost: i32,
+    eos_language_cost: i32,
     right_id: u16,
     segments: Vec<Segment>,
     segment_costs: Vec<SegmentCost>,
@@ -50,20 +52,10 @@ impl Engine {
     }
 
     pub fn candidates(&self, reading: &str, limit: usize) -> Vec<Candidate> {
-        self.candidate_costs(reading, limit)
+        let beam = internal_beam_width(limit);
+        self.candidates_internal(reading, limit, beam, false)
             .into_iter()
-            .map(|candidate| Candidate {
-                text: candidate.text,
-                cost: candidate.cost,
-                segments: candidate
-                    .segments
-                    .into_iter()
-                    .map(|segment| Segment {
-                        reading: segment.reading,
-                        surface: segment.surface,
-                    })
-                    .collect(),
-            })
+            .map(path_to_candidate)
             .collect()
     }
 
@@ -78,20 +70,9 @@ impl Engine {
         limit: usize,
         internal_beam: usize,
     ) -> Vec<Candidate> {
-        self.candidate_costs_with_beam(reading, limit, internal_beam)
+        self.candidates_internal(reading, limit, internal_beam, false)
             .into_iter()
-            .map(|candidate| Candidate {
-                text: candidate.text,
-                cost: candidate.cost,
-                segments: candidate
-                    .segments
-                    .into_iter()
-                    .map(|segment| Segment {
-                        reading: segment.reading,
-                        surface: segment.surface,
-                    })
-                    .collect(),
-            })
+            .map(path_to_candidate)
             .collect()
     }
 
@@ -101,6 +82,19 @@ impl Engine {
         limit: usize,
         internal_beam: usize,
     ) -> Vec<CandidateCost> {
+        self.candidates_internal(reading, limit, internal_beam, true)
+            .into_iter()
+            .map(path_to_candidate_cost)
+            .collect()
+    }
+
+    fn candidates_internal(
+        &self,
+        reading: &str,
+        limit: usize,
+        internal_beam: usize,
+        include_costs: bool,
+    ) -> Vec<ConversionPath> {
         if reading.is_empty() || limit == 0 {
             return Vec::new();
         }
@@ -117,6 +111,8 @@ impl Engine {
             text: String::new(),
             base_cost: 0,
             language_cost: 0,
+            eos_connection_cost: 0,
+            eos_language_cost: 0,
             right_id: BOS_EOS_CONTEXT_ID,
             segments: Vec::new(),
             segment_costs: Vec::new(),
@@ -169,24 +165,28 @@ impl Engine {
                         reading: unknown.to_string(),
                         surface: unknown.to_string(),
                     });
-                    let mut segment_costs = path.segment_costs.clone();
-                    segment_costs.push(SegmentCost {
-                        reading: unknown.to_string(),
-                        surface: unknown.to_string(),
-                        word_cost: UNKNOWN_WORD_COST,
-                        connection_cost,
-                        surface_penalty: 0,
-                        segment_penalty,
-                        language_cost: language_model_cost.cost,
-                        language_order: language_model_cost.order,
-                        backoff_penalty: language_model_cost.backoff_penalty,
-                        unknown_language_model: language_model_cost.unknown,
-                        base_cost: path.base_cost + base_delta,
-                        total_cost: path.base_cost
-                            + base_delta
-                            + path.language_cost
-                            + language_model_cost.cost,
-                    });
+                    let mut segment_costs = Vec::new();
+
+                    if include_costs {
+                        segment_costs = path.segment_costs.clone();
+                        segment_costs.push(SegmentCost {
+                            reading: unknown.to_string(),
+                            surface: unknown.to_string(),
+                            word_cost: UNKNOWN_WORD_COST,
+                            connection_cost,
+                            surface_penalty: 0,
+                            segment_penalty,
+                            language_cost: language_model_cost.cost,
+                            language_order: language_model_cost.order,
+                            backoff_penalty: language_model_cost.backoff_penalty,
+                            unknown_language_model: language_model_cost.unknown,
+                            base_cost: path.base_cost + base_delta,
+                            total_cost: path.base_cost
+                                + base_delta
+                                + path.language_cost
+                                + language_model_cost.cost,
+                        });
+                    }
 
                     paths[end].push(ConversionPath {
                         text,
@@ -194,6 +194,10 @@ impl Engine {
                         base_cost: path.base_cost + base_delta,
 
                         language_cost: path.language_cost + language_model_cost.cost,
+
+                        eos_connection_cost: 0,
+
+                        eos_language_cost: 0,
 
                         right_id: UNKNOWN_CONTEXT_ID,
 
@@ -249,24 +253,28 @@ impl Engine {
 
                         surface: entry.surface.clone(),
                     });
-                    let mut segment_costs = path.segment_costs.clone();
-                    segment_costs.push(SegmentCost {
-                        reading: entry.reading.clone(),
-                        surface: entry.surface.clone(),
-                        word_cost,
-                        connection_cost,
-                        surface_penalty,
-                        segment_penalty,
-                        language_cost: language_model_cost.cost,
-                        language_order: language_model_cost.order,
-                        backoff_penalty: language_model_cost.backoff_penalty,
-                        unknown_language_model: language_model_cost.unknown,
-                        base_cost: path.base_cost + base_delta,
-                        total_cost: path.base_cost
-                            + base_delta
-                            + path.language_cost
-                            + language_model_cost.cost,
-                    });
+                    let mut segment_costs = Vec::new();
+
+                    if include_costs {
+                        segment_costs = path.segment_costs.clone();
+                        segment_costs.push(SegmentCost {
+                            reading: entry.reading.clone(),
+                            surface: entry.surface.clone(),
+                            word_cost,
+                            connection_cost,
+                            surface_penalty,
+                            segment_penalty,
+                            language_cost: language_model_cost.cost,
+                            language_order: language_model_cost.order,
+                            backoff_penalty: language_model_cost.backoff_penalty,
+                            unknown_language_model: language_model_cost.unknown,
+                            base_cost: path.base_cost + base_delta,
+                            total_cost: path.base_cost
+                                + base_delta
+                                + path.language_cost
+                                + language_model_cost.cost,
+                        });
+                    }
 
                     paths[end].push(ConversionPath {
                         text,
@@ -274,6 +282,10 @@ impl Engine {
                         base_cost: path.base_cost + base_delta,
 
                         language_cost: path.language_cost + language_model_cost.cost,
+
+                        eos_connection_cost: 0,
+
+                        eos_language_cost: 0,
 
                         right_id: entry.right_id,
 
@@ -297,7 +309,7 @@ impl Engine {
 
         let mut results = paths[reading.len()]
             .drain(..)
-            .map(|path| {
+            .map(|mut path| {
                 let eos_cost = self
                     .dictionary
                     .matrix()
@@ -310,28 +322,18 @@ impl Engine {
                 let base_cost = path.base_cost + eos_cost;
                 let language_cost = path.language_cost + language_eos_cost;
 
-                CandidateCost {
-                    text: path.text,
-
-                    cost: base_cost + language_cost,
-
-                    base_cost,
-
-                    language_cost,
-
-                    eos_connection_cost: eos_cost,
-
-                    eos_language_cost: language_eos_cost,
-
-                    segments: path.segment_costs,
-                }
+                path.base_cost = base_cost;
+                path.language_cost = language_cost;
+                path.eos_connection_cost = eos_cost;
+                path.eos_language_cost = language_eos_cost;
+                path
             })
             .collect::<Vec<_>>();
 
-        results.sort_by_key(|candidate| candidate.cost);
+        results.sort_by_key(|path| path.base_cost + path.language_cost);
 
         let mut seen = std::collections::HashSet::new();
-        results.retain(|candidate| seen.insert(candidate.text.clone()));
+        results.retain(|path| seen.insert(path.text.clone()));
 
         results.truncate(limit);
 
@@ -405,6 +407,26 @@ impl Engine {
             .count();
 
         penalty + UNUSUAL_CHARACTER_PENALTY * unusual_characters as i32
+    }
+}
+
+fn path_to_candidate(path: ConversionPath) -> Candidate {
+    Candidate {
+        text: path.text,
+        cost: path.base_cost + path.language_cost,
+        segments: path.segments,
+    }
+}
+
+fn path_to_candidate_cost(path: ConversionPath) -> CandidateCost {
+    CandidateCost {
+        text: path.text,
+        cost: path.base_cost + path.language_cost,
+        base_cost: path.base_cost,
+        language_cost: path.language_cost,
+        eos_connection_cost: path.eos_connection_cost,
+        eos_language_cost: path.eos_language_cost,
+        segments: path.segment_costs,
     }
 }
 

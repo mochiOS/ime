@@ -7,6 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut dictionary = None;
     let mut limit = 16;
+    let mut beam = None;
     let mut debug_costs = false;
 
     while let Some(arg) = args.next() {
@@ -19,6 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let value = args.next().ok_or("--limit requires a value")?;
 
                 limit = value.parse()?;
+            }
+
+            "--beam" => {
+                let value = args.next().ok_or("--beam requires a value")?;
+
+                beam = Some(value.parse()?);
             }
 
             "--debug-costs" => {
@@ -47,14 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let candidates = engine.candidate_costs(&reading, limit);
+        if debug_costs {
+            let candidates = match beam {
+                Some(beam) => engine.candidate_costs_with_beam(&reading, limit, beam),
+                None => engine.candidate_costs(&reading, limit),
+            };
 
-        writeln!(stdout, "{}", candidates.len())?;
+            writeln!(stdout, "{}", candidates.len())?;
 
-        for candidate in candidates {
-            writeln!(stdout, "{}", candidate.text)?;
-
-            if debug_costs {
+            for candidate in candidates {
+                writeln!(stdout, "{}", candidate.text)?;
                 writeln!(
                     stdout,
                     "  total={} base={} lm={} eos_conn={} eos_lm={}",
@@ -83,6 +92,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         segment.total_cost
                     )?;
                 }
+            }
+        } else {
+            let candidates = match beam {
+                Some(beam) => engine.candidates_with_beam(&reading, limit, beam),
+                None => engine.candidates(&reading, limit),
+            };
+
+            writeln!(stdout, "{}", candidates.len())?;
+
+            for candidate in candidates {
+                writeln!(stdout, "{}", candidate.text)?;
             }
         }
 
