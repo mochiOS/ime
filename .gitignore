@@ -7,3 +7,4 @@
 **.mime
 *.venv*
 **_pycache_**
+vendor/corpus/corpus.txt
