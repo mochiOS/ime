@@ -1,4 +1,3 @@
-use crate::lattice::Node;
 use crate::{Candidate, Error, Segment, dictionary::*};
 use std::path::Path;
 

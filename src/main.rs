@@ -1,6 +1,4 @@
 use std::io::{self, Write};
-use std::time::Duration;
-
 use crossterm::{
 	cursor,
 	event::{self, Event, KeyCode, KeyEventKind},
